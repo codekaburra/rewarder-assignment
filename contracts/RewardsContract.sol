@@ -55,8 +55,9 @@ contract StakedWrapper {
     IERC20 public stakedToken;
     event Staked(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
-    // Comment: hardcoding address here is not a good practice, suggested to move to constructor
-    address public beneficiary = address(0xDbfd6dAbD2Eaf53e5dBDc5E96fFB7E5E6B201F69);
+
+    // Comment: hardcoding address here is not a good practice, suggested to move to constructor or make it const here
+    address public beneficiary = address(0xDbfd6dAbD2Eaf53e5dBDc5E96fFB7E5E6B201F69); 
 
     function balanceOf(address account) public view returns (uint256) {
         return _balances[account];
@@ -68,12 +69,17 @@ contract StakedWrapper {
         IERC20 st = stakedToken;
         if (st == IERC20(address(0))) {
             //eth
+            /**
+             * Vulnerabilities: according to https://docs.soliditylang.org/en/v0.8.0/control-structures.html#checked-or-unchecked-arithmetic
+             * all "unchecked" should be removed as revert on over- and underflow by default
+             * transaction should be revert if over/underflow happens instead of go on invalid calculation 
+             */
             unchecked {
                 totalSupply += msg.value;
                 _balances[forWhom] += msg.value;
             }
         } else {
-            require(msg.value == 0, "Zero Eth not allowed");
+            require(msg.value == 0, "Zero Eth not allowed"); // Comment: contradicts with error msg.
             require(amount > 0, "Stake should be greater than zero");
             require(st.transferFrom(msg.sender, address(this), amount), _transferErrorMessage);
             unchecked {
@@ -86,25 +92,42 @@ contract StakedWrapper {
 
     function withdraw(uint128 amount) public virtual {
         require(amount <= _balances[msg.sender], "withdraw: balance is lower");
+        // Comment: to be safe, compare with totalSupply as well. i.e. require(amount <=totalSupply, "withdraw: balance is lower than totalSupply");
         unchecked {
             _balances[msg.sender] -= amount;
             totalSupply = totalSupply - amount;
         }
+
         IERC20 st = stakedToken;
-        if (st == IERC20(address(0))) {
+        // Comment: ERC20 case missing handling for buyback 
+        // Comment: buyback to beneficiary for ETH transfer missing result checking
+        // Edited: share param for both ETH & ERC20 transfer
+
+        /** 
+         * Vulnerabilities: for buyback calculation
+         * missing range checking for buyback param, if buyback>100 (i.e. > 100%), the whole calculation are invalid as amountToBeneficiary > user staked balance
+         * Even if added range checking within setBuyback() function, the original buyback param is hardcoded.
+         * Suggested to move it to constructor & call setBuyback() for safe
+        */
+        uint128 amountToBeneficiary = (amount * buyback) / 100;
+        uint128 amountToUser = amount - amountToBeneficiary;
+        if (st == IERC20(address(0))) { // Comment: unnecessary wrapping as IERC20 here. can be just : if (stakedToken==address(0))
             //eth
-            uint128 val = (amount * buyback) / 100;
-            beneficiary.call{value: val}("");
-            (bool success_, ) = msg.sender.call{value: amount - val}("");
+            (bool successBeneficiary_, ) = beneficiary.call{value: amountToBeneficiary}(""); 
+            require(successBeneficiary_, "eth transfer failure - beneficiary"); // Edited: add transfer result checking 
+            (bool success_, ) = msg.sender.call{value: amountToUser}("");
             require(success_, "eth transfer failure");
         } else {
-            require(stakedToken.transfer(msg.sender, amount), _transferErrorMessage);
+            // Comment & Edited: ERC20 case missing handling for buyback , add it back
+            require(stakedToken.transfer(beneficiary, amountToBeneficiary), _transferErrorMessage);
+            require(stakedToken.transfer(msg.sender, amountToUser), _transferErrorMessage);
         }
+        // Comment: personal practice , will keep buyback amount to beneficiary in Withdrawn event as well for reference.
         emit Withdrawn(msg.sender, amount);
     }
 }
 
-contract RewardsETH is StakedTokenWrapper, Ownable {
+contract RewardsETH is StakedWrapper, Ownable { // Edited: Contract Name Mismatched
     IERC20 public rewardToken;
     uint256 public rewardRate;
     uint64 public periodFinish;
@@ -124,6 +147,7 @@ contract RewardsETH is StakedTokenWrapper, Ownable {
         stakedToken = _stakedToken;
     }
 
+    // Comment: updateReward() should be a function instead of modifier
     modifier updateReward(address account) {
         uint128 _rewardPerTokenStored = rewardPerToken();
         lastUpdateTime = lastTimeRewardApplicable();
@@ -161,6 +185,8 @@ contract RewardsETH is StakedTokenWrapper, Ownable {
     }
 
     function stake(uint128 amount) external payable {
+        // Comment: should be checking overall staked amount instead of per each stake() call
+        // Edit if above comment valid: require((balanceOf(msg.sender) + amount) <= maxStakingAmount, "amount exceed max staking amount");
         require(amount < maxStakingAmount, "amount exceed max staking amount");
         stakeFor(msg.sender, amount);
     }
@@ -223,10 +249,21 @@ contract RewardsETH is StakedTokenWrapper, Ownable {
     }
 
     function setBuyback(uint128 value) external onlyOwner {
+        // Comment: this function should be move to StakedWrapper contract instead as buyback param is within StakedWrapper and shared with constructor
+        // Vulnerabilities: add range checking 0-100 , otherwise withdrawal amount will be more then balance
+        require(value<=100, "setBuyback: value out of range"); // Edited
         buyback = value;
     }
 
     function setBuyBackAddr(address addr) external onlyOwner {
+        // Comment: optional - depends on use cases : check non zero address ?
         beneficiary = addr;
     }
 }
+
+
+/**
+ * Extra code practice suggestion
+ * 1. Ether transfer is expensive and shouldn't be done twice for users, keep track of beneficiary eligible amount, then make a function for beneficiary to withdraw them
+ * 2. Items ordering (vars -> mapping -> event -> constructor -> functions)
+ */
